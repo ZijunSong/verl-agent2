@@ -254,6 +254,7 @@ algorithm:
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10
+  sft_lambda: 0.9 # added by songzijun
 
 trainer:
   balance_batch: True

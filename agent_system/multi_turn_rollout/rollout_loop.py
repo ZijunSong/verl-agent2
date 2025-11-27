@@ -274,6 +274,7 @@ class TrajectoryCollector:
         )
         return gen_batch_output
 
+    ### TODO: 这个函数可能有问题
     def vanilla_multi_turn_loop(
             self,
             gen_batch: DataProto, 
@@ -296,7 +297,7 @@ class TrajectoryCollector:
         """
 
         batch_size = len(gen_batch.batch)
-
+        
         # Initial observations from the environment
         obs, infos = envs.reset(kwargs=gen_batch.non_tensor_batch.pop('env_kwargs', None))
 
@@ -320,10 +321,11 @@ class TrajectoryCollector:
         episode_lengths = np.zeros(batch_size, dtype=np.float32)
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
+        
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):
             active_masks = np.logical_not(is_done)
-
+            
             batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -340,11 +342,12 @@ class TrajectoryCollector:
             )
 
             batch_input.meta_info = gen_batch.meta_info
-
+            
             # pad to be divisible by dp_size
             batch_input_padded, pad_size = pad_dataproto_to_divisor(batch_input, actor_rollout_wg.world_size)
             batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
-            # # unpad
+
+            # unpad
             batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
 
             batch.non_tensor_batch['uid'] = uid_batch
@@ -353,10 +356,9 @@ class TrajectoryCollector:
             batch = batch.union(batch_output)
             
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
-            
+
             next_obs, rewards, dones, infos = envs.step(text_actions)
 
-            
             if len(rewards.shape) == 2:
                 rewards = rewards.squeeze(1)
             if len(dones.shape) == 2:
@@ -473,6 +475,7 @@ class TrajectoryCollector:
 
         return total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_tool_callings
 
+    ### TODO: 这个函数内部有问题
     def multi_turn_loop(
             self,
             gen_batch: DataProto, 
@@ -517,7 +520,6 @@ class TrajectoryCollector:
         assert len(total_batch_list) == len(total_traj_uid)
         assert len(total_batch_list) == len(totoal_tool_callings)
         
-
         # Create trajectory data
         gen_batch_output: DataProto = self.gather_rollout_data(
             total_batch_list=total_batch_list,

@@ -407,6 +407,9 @@ class ActorRolloutRefWorker(MegatronWorker):
     @GPUMemoryLogger(role="update_actor", logger=logger)
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        
+        print("[DEBUG][megatron_workers] - update_actor called")
+        
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
             log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
@@ -418,6 +421,11 @@ class ActorRolloutRefWorker(MegatronWorker):
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         dataloader = self.actor.make_minibatch_iterator(data=data)
+        first_batch = next(iter(dataloader))
+        print("[DEBUG] keys in first mini-batch:", first_batch.keys())
+        # 然后再把 dataloader 重新构造一次，因为 next() 已经消耗了它
+        dataloader = self.actor.make_minibatch_iterator(data=data)
+        
         with Timer(name="update_policy", logger=None) as timer:
             metrics = self.actor.update_policy(dataloader=dataloader)
         delta_time = timer.last

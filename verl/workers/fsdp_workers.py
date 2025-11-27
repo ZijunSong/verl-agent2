@@ -596,6 +596,13 @@ class ActorRolloutRefWorker(Worker):
         data = data.to(get_torch_device().current_device())
 
         assert self._is_actor
+        
+        print("[DEBUG][fsdp_workers] keys in data.batch:", data.batch.keys())
+        if "use_sft_loss" in data.batch:
+            mask = data.batch["use_sft_loss"]
+            print("[DEBUG][fsdp_workers] use_sft_loss:", mask.sum().item(), "/", mask.numel())
+
+        
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
@@ -623,6 +630,8 @@ class ActorRolloutRefWorker(Worker):
 
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
             output = output.to("cpu")
+        
+        print(f"[DEBUG][fsdp_workers] update_actor metrics: {metrics}")
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

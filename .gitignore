@@ -7,7 +7,9 @@
 **/outputs
 **/*.tar.gz
 **/playground
-**/wandb
+wandb/
+**/wandb/
+*/wandb/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -64,6 +64,78 @@ from gigpo import core_gigpo
 
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
+def mark_groups_without_positive_samples(
+    data,
+    pos_threshold: float = 0.0,
+    group_key: str = "uid",          # ← 用 "uid"
+    reward_key: str = "returns",     # ← 和 compute_advantage 的输出保持一致
+):
+    """
+    Mark which groups contain no positive samples (reward > pos_threshold).
+    Will add two boolean arrays into data.non_tensor_batch:
+      - group_has_positive: [B], True if its group has any positive sample
+      - use_sft_loss: [B], True if the sample should follow SFT branch (no positives in its group)
+    """
+
+    # 1) Fetch scalar rewards
+    if reward_key in data.batch:
+        reward_tensor = data.batch[reward_key]
+    elif "token_level_rewards" in data.batch:
+        reward_tensor = data.batch["token_level_rewards"].sum(dim=-1)
+    else:
+        raise ValueError(
+            f"mark_groups_without_positive_samples: neither '{reward_key}' "
+            f"nor 'token_level_rewards' found in data.batch"
+        )
+
+    if not isinstance(reward_tensor, torch.Tensor):
+        raise TypeError(f"{reward_key} must be a torch.Tensor, got {type(reward_tensor)}")
+
+    rewards = reward_tensor.detach().cpu().float().numpy()  # [B]
+    B = rewards.shape[0]
+    
+    if rewards.ndim > 1:
+        print("rewards.shape:", rewards.shape)
+        rewards = rewards.mean(axis=-1)
+
+    # 2) Build group ids
+    non_tensor = data.non_tensor_batch
+    if group_key not in non_tensor:
+        raise KeyError(f"group_key '{group_key}' not found in data.non_tensor_batch")
+
+    base_group_ids = np.asarray(non_tensor[group_key])
+    if base_group_ids.shape[0] != B:
+        raise ValueError(f"len({group_key})={base_group_ids.shape[0]} != batch_size={B}")
+
+    if "traj_uid" in non_tensor:
+        traj_ids = np.asarray(non_tensor["traj_uid"])
+        if traj_ids.shape[0] != B:
+            raise ValueError("len(traj_uid) mismatch with batch size")
+        group_ids = np.asarray([f"{g}@@{t}" for g, t in zip(base_group_ids, traj_ids)], dtype=object)
+    else:
+        group_ids = base_group_ids.astype(object)
+
+    # 3) Aggregate by group to see if any reward > threshold
+    group_has_positive_map = {}
+
+    for gid, r in zip(group_ids, rewards):
+        if r > pos_threshold:
+            group_has_positive_map[gid] = True
+        else:
+            group_has_positive_map.setdefault(gid, False)
+
+    # 4) Scatter back to each sample
+    group_has_positive = np.asarray([group_has_positive_map.get(gid, False) for gid in group_ids], dtype=bool)
+    use_sft_loss = ~group_has_positive
+
+    # 5) Write back
+    non_tensor["group_has_positive"] = group_has_positive
+    non_tensor["use_sft_loss"] = use_sft_loss
+    
+    data.batch["use_sft_loss"] = torch.from_numpy(use_sft_loss).to(reward_tensor.device)
+
+    return data
+
 WorkerType = Type[Worker]
 
 
@@ -752,7 +824,7 @@ class RayPPOTrainer:
                                                     envs=self.val_envs,
                                                     is_train=False,
                                                     )
-            print('validation generation end')
+
             del test_batch
             test_batch = test_output_gen_batch
             # Store generated outputs
@@ -896,7 +968,7 @@ class RayPPOTrainer:
             self.rm_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg["actor_rollout"]
+        self.actor_rollout_wg = all_wg["actor_rollout"] # verl.single_controller.ray.base.RayWorkerGroup        
         self.actor_rollout_wg.init_model()
 
         # create async rollout manager and request scheduler
@@ -1011,6 +1083,9 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+
+        print("[INFO] - Starting training loop...")
+        
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
@@ -1026,6 +1101,8 @@ class RayPPOTrainer:
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        
+        print(f"[INFO] - checkpoint loaded")
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -1044,10 +1121,17 @@ class RayPPOTrainer:
         self.global_steps += 1
         last_val_metrics = None
 
+        print(f"[INFO] - Starting epochs...")
+        
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
+                # print("[DEBUG] 当前 batch_dict 的键：", list(batch_dict.keys()))
+                # ['input_ids', 'attention_mask', 'position_ids', 'answer', 'data_source', 'ability', 'extra_info', 'raw_prompt_ids', 'raw_prompt', 'index', 'tools_kwargs']
                 metrics = {}
                 timing_raw = {}
+                
+                print("[INFO] - 1. 构造 DataProto")
+                
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
@@ -1061,6 +1145,9 @@ class RayPPOTrainer:
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
                 if "env_kwargs" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("env_kwargs")
+                    
+                print("[INFO] - 2. 拿出用于生成的部分 gen_batch")
+                
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
@@ -1079,12 +1166,14 @@ class RayPPOTrainer:
                         #     self.async_rollout_manager.sleep()
 
                         ################ agent-environment loop ###############
+                        print("[INFO] - 3. 交给 traj_collector + env 做多轮交互，得到带 response 的 batch")
                         gen_batch_output = self.traj_collector.multi_turn_loop(
                                                                 gen_batch=gen_batch,
                                                                 actor_rollout_wg=self.actor_rollout_wg,
                                                                 envs=self.envs,
                                                                 is_train=True,
                                                                 )
+                        
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
@@ -1107,13 +1196,27 @@ class RayPPOTrainer:
                     # batch = batch.union(gen_batch_output)
                     del batch
                     batch = gen_batch_output
+                    
+                    if self.global_steps <= 3:  # 前几步看一眼就行
+                        print("[DEBUG] non_tensor_batch keys after multi_turn_loop:", batch.non_tensor_batch.keys())
+                        for k in ["uid", "traj_uid", "index"]:
+                            if k in batch.non_tensor_batch:
+                                arr = batch.non_tensor_batch[k]
+                                try:
+                                    print(f"[DEBUG] {k}: shape={getattr(arr, 'shape', None)}, first_5={arr[:5]}")
+                                except Exception as e:
+                                    print(f"[DEBUG] {k}: type={type(arr)}, preview={str(arr)[:200]}")
 
+                    print("[INFO] - 4. GiGPO 用到的 step 回报")
+                    
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
                         step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
                             batch=batch,
                             gamma=self.config.algorithm.gamma
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
+                    
+                    print("[INFO] - 5. 一些 batch 的调整")
                     
                     batch = adjust_batch(self.config, batch)
 
@@ -1128,7 +1231,9 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     with _timer("reward", timing_raw):
-                        # compute reward model score
+                        
+                        print("[INFO] - 6. 计算 reward（rule-based / RM）")
+                        
                         if self.use_rm:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
@@ -1140,6 +1245,9 @@ class RayPPOTrainer:
 
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):
+                        
+                        print("[INFO] - 7. 重算old_log_prob，算熵")
+                        
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
@@ -1173,7 +1281,9 @@ class RayPPOTrainer:
                                     "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
                                 }
                             )
-
+                            
+                    print("[INFO] - 8. ref policy log_prob（如果有）")
+                    
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer("ref", timing_raw):
@@ -1183,7 +1293,8 @@ class RayPPOTrainer:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
-                    # compute values
+                    print("[INFO] - 9. critic value（如果有）")
+                    
                     if self.use_critic:
                         with _timer("values", timing_raw):
                             values = self.critic_wg.compute_values(batch)
@@ -1218,6 +1329,7 @@ class RayPPOTrainer:
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
 
+                        print("[INFO] - 10. 计算 advantage（GRPO / GAE / ...）")
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1235,22 +1347,39 @@ class RayPPOTrainer:
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
                         )
 
-                    # update critic
+                    ### 在这里做 group 粒度的“有没有正样本”检查和标注
+                    batch = mark_groups_without_positive_samples(
+                        batch,
+                        pos_threshold=self.config.algorithm.get("pos_threshold", 0.0),
+                        group_key="uid",    
+                        reward_key="returns" 
+                    )
+                    
+                    sft_lambda_cfg = self.config.algorithm.get("sft_lambda", 1.0)  
+                    # TODO: 这里将来可以按 self.global_steps 做 step 退火
+                    batch.meta_info["sft_lambda"] = float(sft_lambda_cfg)
+
+                    print("[INFO] - 11. update_critic（如果用 critic）")
+                    
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
-                    # implement critic warmup
+                    ### TODO: 当 RL 一个 group 里无法采到正样本的时候，将该 prompt 用 SFT 学习
+                    print("[DEBUG] - 当 RL 一个 group 里无法采到正样本的时候，将该 prompt 用 SFT 学习")
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer("update_actor", timing_raw):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            print("[DEBUG] - 看看会跳转到哪里去更新 actor")
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
-
+                    
+                    print("[INFO] - 12. 其他杂项，比如存日志、验证、存checkpoint")
+                    
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:

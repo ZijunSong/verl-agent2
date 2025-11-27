@@ -269,6 +269,11 @@ class MegatronPPOActor(BasePPOActor):
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        
+        if "use_sft_loss" in data.batch:
+            print("[DEBUG] use_sft_loss found in data.batch")
+            select_keys.append("use_sft_loss")
+        
         data = data.select(batch_keys=select_keys)
         return data.make_iterator(
             mini_batch_size=self.config.ppo_mini_batch_size,
@@ -486,6 +491,17 @@ class MegatronPPOActor(BasePPOActor):
         metrics = {}
         self.prof.start()
         for data in dataloader:
+            
+            if "use_sft_loss" in data.batch:
+                mask = data.batch["use_sft_loss"]
+                print("[DEBUG][actor] use_sft_loss in this mini-batch:",
+                    mask.sum().item(), "/", mask.numel())
+
+                use_sft = data.batch["use_sft_loss"]
+                num_sft = int(use_sft.sum().item())
+                num_total = use_sft.numel()
+                print(f"[DEBUG][actor] mini-batch SFT samples: {num_sft}/{num_total}")
+        
             # data = data.batch.to(self.actor_module.device)
             self.actor_optimizer.zero_grad()
             # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm

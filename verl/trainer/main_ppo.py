@@ -77,6 +77,7 @@ class TaskRunner:
 
         # define worker classes
         if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
+            print("[DEBUG][main_ppo] Using FSDP strategy for actor and critic")
             assert config.critic.strategy in ["fsdp", "fsdp2"]
             from verl.single_controller.ray import RayWorkerGroup
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
@@ -85,6 +86,7 @@ class TaskRunner:
             ray_worker_group_cls = RayWorkerGroup
 
         elif config.actor_rollout_ref.actor.strategy == "megatron":
+            print("[DEBUG][main_ppo] Using Megatron strategy for actor and critic")
             assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
             from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
             from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
@@ -110,7 +112,7 @@ class TaskRunner:
             Role.ActorRollout: global_pool_id,
             Role.Critic: global_pool_id,
         }
-
+        
         # we should adopt a multi-source reward function here
         # - for rule-based rm, we directly call a reward score
         # - for model-based rm, we call a model
@@ -150,12 +152,13 @@ class TaskRunner:
 
         from agent_system.multi_turn_rollout import TrajectoryCollector
         traj_collector = TrajectoryCollector(config=config, tokenizer=tokenizer, processor=processor)
-
+        
         from verl.utils.dataset.rl_dataset import collate_fn
 
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
         train_sampler = create_rl_sampler(config.data, train_dataset)
+        
         trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,

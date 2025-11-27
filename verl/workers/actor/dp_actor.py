@@ -312,6 +312,49 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
+    def _compute_sft_loss(self, batch, temperature: float):
+        """
+        这里假设 batch 里都是需要 SFT 的样本。
+        暂时用 responses 对齐到 input_ids 的最后一段作为 label。
+        后面可以替换成真正的 answer 标签。
+        """
+        input_ids = batch["input_ids"]          # [B, T]
+        attention_mask = batch["attention_mask"]
+        position_ids = batch["position_ids"]
+        responses = batch["responses"]          # [B, R]
+
+        B, T = input_ids.size()
+        R = responses.size(1)
+        start = T - R
+        print(f"[DEBUG][dp_actor] - B={B}, T={T}, R={R}, start={start}")
+
+        labels = input_ids.new_full(input_ids.shape, -100)
+        labels[:, start:] = responses
+        print(f"[DEBUG][dp_actor] - labels.shape={labels.shape}, dtype={labels.dtype}")
+        print(f"[DEBUG][dp_actor] - labels[0, start-2:start+3]={labels[0, start-2:start+3]}")
+
+        outputs = self.actor_module(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        logits = outputs.logits / temperature
+        print(f"[DEBUG][dp_actor] - logits.shape={logits.shape}, temperature={temperature}")
+        print(f"[DEBUG][dp_actor] - logits[0, -1, :5]={logits[0, -1, :5].tolist()}")
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        print(f"[DEBUG][dp_actor] - shift_logits.shape={shift_logits.shape}")
+        print(f"[DEBUG][dp_actor] - shift_labels.shape={shift_labels.shape}")
+
+        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+        sft_loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        )
+        print(f"[DEBUG][dp_actor] - sft_loss={sft_loss.item():.6f}")
+        return sft_loss
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
@@ -319,12 +362,19 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
+        sft_lambda = float(data.meta_info.get("sft_lambda", 1.0))  # added by songzijun
+        print(f"[DEBUG][dp_actor] sft_lambda: {sft_lambda}")
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+            
+        if "use_sft_loss" in data.batch: ### added by songzijun
+            print("[DEBUG][dp_actor] use_sft_loss found in data.batch")
+            select_keys.append("use_sft_loss")
+        
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -343,25 +393,40 @@ class DataParallelPPOActor(BasePPOActor):
                 # split batch into micro_batches
                 mini_batch = data
                 if has_multi_modal_inputs:
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                    self.gradient_accumulation = (
+                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                    )
                     num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
                     micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
                 elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
                 else:
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                    self.gradient_accumulation = (
+                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                    )
                     # split batch into micro_batches
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
 
-                for data in micro_batches:
+                for micro_idx, data in enumerate(micro_batches):
+                    print(f"[DEBUG][dp_actor] - Processing micro-batch {micro_idx}")
                     # Support all hardwares
                     if isinstance(data, DataProto):
                         data = {**data.batch.to(get_torch_device().current_device()), **data.non_tensor_batch}
                     else:
                         data = data.to(get_torch_device().current_device())  # actor device is cpu when using offload
+
+                    # ====== 1) 准备 SFT/RL mask ======
+                    use_sft = None
+                    if "use_sft_loss" in data:
+                        mask = data["use_sft_loss"]
+                        if not torch.is_tensor(mask):
+                            mask = torch.as_tensor(mask, device=get_torch_device().current_device())
+                        use_sft = mask.to(torch.bool)
+                        print("[DEBUG][dp_actor] use_sft_loss:", use_sft.sum().item(), "/", use_sft.numel())
+
                     responses = data["responses"]
                     response_length = responses.size(1)
                     attention_mask = data["attention_mask"]
@@ -370,22 +435,39 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         response_mask = attention_mask[:, -response_length:]
 
+                    # RL 部分只用非 SFT 样本；SFT 部分只用 SFT 样本
+                    if use_sft is not None:
+                        rl_sample_mask = (~use_sft).float().unsqueeze(1)  # [B,1]
+                        sft_sample_mask = use_sft.float().unsqueeze(1)     # [B,1]
+                        response_mask_rl = response_mask * rl_sample_mask  # [B,R]
+                        sft_token_mask = response_mask * sft_sample_mask   # [B,R]
+                        print(f"[DEBUG][dp_actor] - RL mask sum: {response_mask_rl.sum().item()}")
+                        print(f"[DEBUG][dp_actor] - SFT mask sum: {sft_token_mask.sum().item()}")
+                    else:
+                        response_mask_rl = response_mask
+                        sft_token_mask = torch.zeros_like(response_mask)  # no SFT tokens
+
+                    # ====== 2) 原始 RL forward（只跑一次） ======
                     old_log_prob = data["old_log_probs"]
                     advantages = data["advantages"]
 
                     clip_ratio = self.config.clip_ratio
-                    clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
-                    clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
+                    clip_ratio_low = (
+                        self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
+                    )
+                    clip_ratio_high = (
+                        self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
+                    )
                     clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
                     # all return: (bsz, response_length)
-                    calculate_entropy = False
-                    if entropy_coeff != 0:
-                        calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
-                    
+                    calculate_entropy = entropy_coeff != 0
+                    entropy, log_prob = self._forward_micro_batch(
+                        micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy
+                    )
+
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
                         policy_loss_fn = compute_policy_loss
@@ -394,11 +476,12 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         raise ValueError(f"Unsupported loss_mode: {loss_mode}")
 
+                    # ⚠️ 注意这里用的是 response_mask_rl，而不是原始 response_mask
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
-                        response_mask=response_mask,
+                        response_mask=response_mask_rl,
                         cliprange=clip_ratio,
                         cliprange_low=clip_ratio_low,
                         cliprange_high=clip_ratio_high,
@@ -406,41 +489,70 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                     )
 
+                    # RL loss（只对 RL 样本有效）
                     if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        entropy_loss = agg_loss(
+                            loss_mat=entropy, loss_mask=response_mask_rl, loss_agg_mode=loss_agg_mode
+                        )
+                        rl_loss = pg_loss - entropy_loss * entropy_coeff
+                        print(f"[DEBUG][dp_actor] - Entropy loss: {entropy_loss.detach().item():.6f}")
                     else:
-                        policy_loss = pg_loss
+                        rl_loss = pg_loss
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data["ref_log_prob"]
                         # compute kl loss
-                        kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        kld = kl_penalty(
+                            logprob=log_prob,
+                            ref_logprob=ref_log_prob,
+                            kl_penalty=self.config.kl_loss_type,
+                        )
+                        kl_loss = agg_loss(
+                            loss_mat=kld, loss_mask=response_mask_rl, loss_agg_mode=loss_agg_mode
+                        )
 
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                        rl_loss = rl_loss + kl_loss * self.config.kl_loss_coef
                         metrics["actor/kl_loss"] = kl_loss.detach().item()
                         metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                        print(f"[DEBUG][dp_actor] - KL loss: {kl_loss.detach().item():.6f}")
 
+                    # ====== 3) SFT loss：复用 log_prob + sft_token_mask ======
+                    # log_prob: [B,R]，sft_token_mask: [B,R] （只有 SFT 样本的 token 为 1）
+                    if sft_token_mask.sum() > 0:
+                        # 只在 SFT token 上做 -log p 的平均
+                        sft_token_logprob = log_prob * sft_token_mask
+                        sft_loss = -sft_token_logprob.sum() / (sft_token_mask.sum() + 1e-8)
+                        print(f"[DEBUG][dp_actor] - SFT loss computed with {sft_token_mask.sum().item()} tokens")
+                    else:
+                        sft_loss = torch.zeros_like(rl_loss)
+                        print("[DEBUG][dp_actor] - No SFT tokens, SFT loss set to 0")
+
+                    metrics["actor/sft_loss"] = sft_loss.detach().item()
+
+                    # ====== 4) 用 λ 混合，两种 loss 一起 backward（每个 micro-batch 只 backward 一次） ======
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
-                        loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+                        scale = (len(data) / self.config.ppo_mini_batch_size)
                     else:
-                        loss = policy_loss / self.gradient_accumulation
-                    loss.backward()
+                        scale = 1.0 / self.gradient_accumulation
 
-                    data = {
+                    total_loss = ((1.0 - sft_lambda) * rl_loss + sft_lambda * sft_loss) * scale
+                    print(f"[DEBUG][dp_actor] - Total loss: {total_loss.detach().item():.6f} (RL: {rl_loss.detach().item():.6f}, SFT: {sft_loss.detach().item():.6f}, λ: {sft_lambda})")
+                    total_loss.backward()
+
+                    data_metrics = {
                         "actor/pg_loss": pg_loss.detach().item(),
                         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                         "actor/ppo_kl": ppo_kl.detach().item(),
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                        "actor/sft_lambda": sft_lambda,
                     }
-                    append_to_dict(metrics, data)
+                    append_to_dict(metrics, data_metrics)
 
                 grad_norm = self._optimizer_step()
-                data = {"actor/grad_norm": grad_norm.detach().item()}
-                append_to_dict(metrics, data)
+                data_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                append_to_dict(metrics, data_metrics)
+                print(f"[DEBUG][dp_actor] - Gradient norm after optimizer step: {grad_norm.detach().item():.6f}")
+
         self.actor_optimizer.zero_grad()
         return metrics
